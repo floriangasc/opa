@@ -191,6 +191,12 @@ To skip bundle verification, use the --skip-verify flag.
 	runCommand.Flags().BoolVar(&cmdParams.skipVersionCheck, "skip-version-check", false, "disables anonymous version reporting (see: https://openpolicyagent.org/docs/latest/privacy)")
 	addIgnoreFlag(runCommand.Flags(), &cmdParams.ignore)
 
+	// store disk
+	runCommand.Flags().VarP(cmdParams.rt.StoreType, "store-type", "", "inmemory or disk storage")
+	runCommand.Flags().StringVarP(&cmdParams.rt.StoreDiskTmpDir, "store-disk-tmp-dir", "", "", "directory where store disk will put theirs files")
+	runCommand.Flags().StringVarP(&cmdParams.rt.StoreDiskTmpSchema, "store-disk-tmp-schema", "", "OPEN_POLCY_AGENT_STORE", "directory where store disk will put theirs files")
+	cmdParams.rt.StoreDiskKeys = runCommand.Flags().StringSlice("store-disk-keys", []string{}, "ram optimisation for load only that needed (cf disk store doc)")
+
 	// bundle verification config
 	addVerificationKeyFlag(runCommand.Flags(), &cmdParams.pubKey)
 	addVerificationKeyIDFlag(runCommand.Flags(), &cmdParams.pubKeyID, defaultPublicKeyID)
