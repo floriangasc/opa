@@ -12,6 +12,7 @@ import (
 	"crypto/x509"
 	"fmt"
 	"io"
+	"io/ioutil"
 	mr "math/rand"
 	"os"
 	"os/signal"
@@ -43,6 +44,7 @@ import (
 	"github.com/open-policy-agent/opa/repl"
 	"github.com/open-policy-agent/opa/server"
 	"github.com/open-policy-agent/opa/storage"
+	"github.com/open-policy-agent/opa/storage/disk"
 	"github.com/open-policy-agent/opa/storage/inmem"
 	"github.com/open-policy-agent/opa/util"
 	"github.com/open-policy-agent/opa/version"
@@ -195,6 +197,11 @@ type Params struct {
 	// Router uses a first-matching-route-wins strategy, so no existing routes are overridden
 	// If it is nil, a new mux.Router will be created
 	Router *mux.Router
+
+	StoreType          *util.EnumFlag
+	StoreDiskTmpDir    string
+	StoreDiskTmpSchema string
+	StoreDiskKeys      *[]string
 }
 
 // LoggingConfig stores the configuration for OPA's logging behaviour.
@@ -209,6 +216,10 @@ func NewParams() Params {
 		Output:             os.Stdout,
 		BundleMode:         false,
 		EnableVersionCheck: false,
+		StoreType:          util.NewEnumFlag("inmemory", []string{"inmemory", "disk"}),
+		StoreDiskTmpDir:    "",
+		StoreDiskTmpSchema: "OPEN_POLCY_AGENT_STORE",
+		StoreDiskKeys:      &[]string{},
 	}
 }
 
@@ -226,6 +237,33 @@ type Runtime struct {
 	serverInitialized bool
 	serverInitMtx     sync.RWMutex
 	done              chan struct{}
+}
+
+func createStore(ctx context.Context, params Params) (*storage.Store, error) {
+	var effectiveStore storage.Store
+	if params.StoreType.String() == "disk" {
+		dir, errTmpDir := ioutil.TempDir(params.StoreDiskTmpDir, params.StoreDiskTmpSchema)
+		if errTmpDir != nil {
+			return nil, errors.Wrap(errTmpDir, "tmp disk failed")
+
+		}
+		var partitions []storage.Path = []storage.Path{}
+		for _, key := range *params.StoreDiskKeys {
+			path := storage.MustParsePath(key)
+			partitions = append(partitions, path)
+		}
+		s, errStore := disk.New(ctx, disk.Options{Dir: dir, Partitions: partitions})
+		if errStore != nil {
+			return nil, errors.Wrap(errStore, "store type disk error")
+
+		}
+		effectiveStore = s
+	} else if params.StoreType.String() == "inmemory" {
+		effectiveStore = inmem.New()
+	} else {
+		return nil, errors.New("Unexpected <~storyType: " + params.StoreType.String() + " ~>")
+	}
+	return &effectiveStore, nil
 }
 
 // NewRuntime returns a new Runtime object initialized with params. Clients must
@@ -299,9 +337,13 @@ func NewRuntime(ctx context.Context, params Params) (*Runtime, error) {
 		consoleLogger = params.ConsoleLogger
 	}
 
+	s, errStore := createStore(ctx, params)
+	if errStore != nil {
+		return nil, errStore
+	}
 	manager, err := plugins.New(config,
 		params.ID,
-		inmem.New(),
+		*s,
 		plugins.Info(info),
 		plugins.InitBundles(loaded.Bundles),
 		plugins.InitFiles(loaded.Files),
