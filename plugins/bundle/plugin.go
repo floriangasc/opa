@@ -316,7 +316,7 @@ func (p *Plugin) loadAndActivateBundlesFromDisk(ctx context.Context) error {
 
 			p.status[name].Metrics = metrics.New()
 
-			err = p.activate(ctx, name, b)
+			err = p.activate(ctx, name, name, b)
 			if err != nil {
 				p.log(name).Error("Bundle activation failed: %v", err)
 				return err
@@ -413,8 +413,13 @@ func (p *Plugin) process(ctx context.Context, name string, u download.Update) {
 
 		p.status[name].Metrics.Timer(metrics.RegoLoadBundles).Start()
 		defer p.status[name].Metrics.Timer(metrics.RegoLoadBundles).Stop()
-
-		if err := p.activate(ctx, name, u.Bundle); err != nil {
+		var effectiveBundleName string
+		if u.BundleName == "" {
+			effectiveBundleName = name
+		} else {
+			effectiveBundleName = name + "/" + u.BundleName
+		}
+		if err := p.activate(ctx, name, effectiveBundleName, u.Bundle); err != nil {
 			p.log(name).Error("Bundle activation failed: %v", err)
 			p.status[name].SetError(err)
 			if !p.stopped {
@@ -444,11 +449,11 @@ func (p *Plugin) process(ctx context.Context, name string, u download.Update) {
 		p.status[name].SetActivateSuccess(u.Bundle.Manifest.Revision)
 
 		if u.ETag != "" {
-			p.log(name).Info("Bundle loaded and activated successfully. Etag updated to %v.", u.ETag)
+			p.log(effectiveBundleName).Info("Bundle loaded and activated successfully. Etag updated to %v.", u.ETag)
 		} else {
-			p.log(name).Info("Bundle loaded and activated successfully.")
+			p.log(effectiveBundleName).Info("Bundle loaded and activated successfully.")
 		}
-		p.etags[name] = u.ETag
+		p.etags[name] = u.ETag // TODO what etag should be this of metab
 
 		// If the plugin wasn't ready yet then check if we are now after activating this bundle.
 		p.checkPluginReadiness()
@@ -479,15 +484,15 @@ func (p *Plugin) checkPluginReadiness() {
 	}
 }
 
-func (p *Plugin) activate(ctx context.Context, name string, b *bundle.Bundle) error {
-	p.log(name).Debug("Bundle activation in progress. Opening storage transaction.")
+func (p *Plugin) activate(ctx context.Context, downloaderName string, bundleName string, b *bundle.Bundle) error {
+	p.log(downloaderName).Debug("Bundle activation in progress. Opening storage transaction.")
 
 	params := storage.WriteParams
 	params.Context = storage.NewContext()
 
 	err := storage.Txn(ctx, p.manager.Store, params, func(txn storage.Transaction) error {
-		p.log(name).Debug("Opened storage transaction (%v).", txn.ID())
-		defer p.log(name).Debug("Closing storage transaction (%v).", txn.ID())
+		p.log(downloaderName).Debug("Opened storage transaction (%v).", txn.ID())
+		defer p.log(downloaderName).Debug("Closing storage transaction (%v).", txn.ID())
 
 		// Compile the bundle modules with a new compiler and set it on the
 		// transaction params for use by onCommit hooks.
@@ -503,8 +508,8 @@ func (p *Plugin) activate(ctx context.Context, name string, b *bundle.Bundle) er
 			Txn:      txn,
 			TxnCtx:   params.Context,
 			Compiler: compiler,
-			Metrics:  p.status[name].Metrics,
-			Bundles:  map[string]*bundle.Bundle{name: b},
+			Metrics:  p.status[downloaderName].Metrics,
+			Bundles:  map[string]*bundle.Bundle{bundleName: b},
 		}
 
 		if p.config.IsMultiBundle() {

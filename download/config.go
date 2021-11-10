@@ -25,8 +25,9 @@ type PollingConfig struct {
 
 // Config represents the configuration for the downloader.
 type Config struct {
-	Trigger *plugins.TriggerMode `json:"trigger,omitempty"`
-	Polling PollingConfig        `json:"polling"`
+	Trigger    *plugins.TriggerMode `json:"trigger,omitempty"`
+	Polling    PollingConfig        `json:"polling"`
+	MetaBundle bool                 `json:"meta_bundle"`
 }
 
 // ValidateAndInjectDefaults checks for configuration errors and ensures all

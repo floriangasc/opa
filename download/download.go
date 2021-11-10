@@ -6,7 +6,9 @@
 package download
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
@@ -36,11 +38,12 @@ const (
 // field will be non-nil. If a new bundle is available, the Bundle field will
 // be non-nil.
 type Update struct {
-	ETag    string
-	Bundle  *bundle.Bundle
-	Error   error
-	Metrics metrics.Metrics
-	Raw     io.Reader
+	BundleName string
+	ETag       string
+	Bundle     *bundle.Bundle
+	Error      error
+	Metrics    metrics.Metrics
+	Raw        io.Reader
 }
 
 // Downloader implements low-level OPA bundle downloading. Downloader can be
@@ -66,8 +69,8 @@ type Downloader struct {
 }
 
 type downloaderResponse struct {
-	b        *bundle.Bundle
-	raw      io.Reader
+	/*	b        *bundle.Bundle
+		raw      io.Reader*/
 	etag     string
 	longPoll bool
 }
@@ -238,8 +241,13 @@ func (d *Downloader) loop(ctx context.Context) {
 }
 
 func (d *Downloader) oneShot(ctx context.Context) (bool, error) {
+	callback := func(u Update) {
+		if d.f != nil {
+			d.f(ctx, u)
+		}
+	}
 	m := metrics.New()
-	resp, err := d.download(ctx, m)
+	resp, err := d.download(ctx, m, callback)
 
 	if err != nil {
 		d.etag = ""
@@ -253,14 +261,16 @@ func (d *Downloader) oneShot(ctx context.Context) (bool, error) {
 
 	d.etag = resp.etag
 
-	if d.f != nil {
-		d.f(ctx, Update{ETag: resp.etag, Bundle: resp.b, Error: nil, Metrics: m, Raw: resp.raw})
-	}
+	/*
+		if d.f != nil {
+			d.f(ctx, Update{ETag: resp.etag, Bundle: resp.b, Error: nil, Metrics: m, Raw: resp.raw})
+		}
+	*/
 
 	return resp.longPoll, nil
 }
 
-func (d *Downloader) download(ctx context.Context, m metrics.Metrics) (*downloaderResponse, error) {
+func (d *Downloader) download(ctx context.Context, m metrics.Metrics, callback func(Update)) (*downloaderResponse, error) {
 	d.logger.Debug("Download starting.")
 
 	d.client = d.client.WithHeader("If-None-Match", d.etag)
@@ -287,33 +297,32 @@ func (d *Downloader) download(ctx context.Context, m metrics.Metrics) (*download
 
 	switch resp.StatusCode {
 	case http.StatusOK:
-		var buf bytes.Buffer
 		if resp.Body != nil {
 			d.logger.Debug("Download in progress.")
 			m.Timer(metrics.RegoLoadBundles).Start()
 			defer m.Timer(metrics.RegoLoadBundles).Stop()
-			baseURL := path.Join(d.client.Config().URL, d.path)
+			/*
+				var buf bytes.Buffer
+					baseURL := path.Join(d.client.Config().URL, d.path)
+					var loader bundle.DirectoryLoader
+					if d.persist {
+						tee := io.TeeReader(resp.Body, &buf)
+						loader = bundle.NewTarballLoaderWithBaseURL(tee, baseURL)
+					} else {
+						loader = bundle.NewTarballLoaderWithBaseURL(resp.Body, baseURL)
+					}
 
-			var loader bundle.DirectoryLoader
-			if d.persist {
-				tee := io.TeeReader(resp.Body, &buf)
-				loader = bundle.NewTarballLoaderWithBaseURL(tee, baseURL)
-			} else {
-				loader = bundle.NewTarballLoaderWithBaseURL(resp.Body, baseURL)
-			}
-
-			reader := bundle.NewCustomReader(loader).WithMetrics(m).WithBundleVerificationConfig(d.bvc)
-			if d.sizeLimitBytes != nil {
-				reader = reader.WithSizeLimitBytes(*d.sizeLimitBytes)
-			}
-			b, err := reader.Read()
-			if err != nil {
-				return nil, err
-			}
-
+					reader := bundle.NewCustomReader(loader).WithMetrics(m).WithBundleVerificationConfig(d.bvc)
+					if d.sizeLimitBytes != nil {
+						reader = reader.WithSizeLimitBytes(*d.sizeLimitBytes)
+					}
+					b, err := reader.Read()
+					if err != nil {
+						return nil, err
+					}
+			*/
+			d.metaBundle(ctx, resp.Body, callback)
 			return &downloaderResponse{
-				b:        &b,
-				raw:      &buf,
 				etag:     resp.Header.Get("ETag"),
 				longPoll: isLongPollSupported(resp.Header),
 			}, nil
@@ -321,8 +330,6 @@ func (d *Downloader) download(ctx context.Context, m metrics.Metrics) (*download
 
 		d.logger.Debug("Server replied with empty body.")
 		return &downloaderResponse{
-			b:        nil,
-			raw:      nil,
 			etag:     "",
 			longPoll: isLongPollSupported(resp.Header),
 		}, nil
@@ -332,8 +339,6 @@ func (d *Downloader) download(ctx context.Context, m metrics.Metrics) (*download
 			etag = d.etag
 		}
 		return &downloaderResponse{
-			b:        nil,
-			raw:      nil,
 			etag:     etag,
 			longPoll: isLongPollSupported(resp.Header),
 		}, nil
@@ -348,4 +353,86 @@ func (d *Downloader) download(ctx context.Context, m metrics.Metrics) (*download
 
 func isLongPollSupported(header http.Header) bool {
 	return header.Get("Content-Type") == "application/vnd.openpolicyagent.bundles"
+}
+
+func (d *Downloader) metaBundle(ctx context.Context, body io.ReadCloser, callback func(Update)) {
+	fmt.Println("AAAAAAAAAAaaa metabundle 0 AAAAAAAAAAAAAAAa ", d.config.MetaBundle)
+	if d.config.MetaBundle == false {
+		var bundleName string = ""
+		u, err := d.regularBundle(body, bundleName)
+		if err != nil {
+			fmt.Println(errors.Wrapf(err, "EEEEEEEEEEEEEEe regular bundle failed"))
+		} else {
+			callback(*u)
+		}
+		return
+	}
+	//*-
+	gr, err := gzip.NewReader(body)
+	if err != nil {
+		fmt.Println(errors.Wrap(err, "archive read failed"))
+	}
+	defer gr.Close()
+
+	reader := tar.NewReader(gr)
+	nbBundle := 0
+	start := time.Now()
+	for {
+		header, err := reader.Next()
+		if err == io.EOF {
+			break
+		}
+		filename := header.Name
+		// fmt.Println("AAAAAAAAAAAA metabaundle 20 header  ", filename, err)
+		if filename == ".manifest" {
+			// TODO: may manifest can be usefull for list all bundle present or something like that
+		} else {
+			switch header.Typeflag {
+			case tar.TypeReg:
+
+				var regularBundleBuffer bytes.Buffer
+				if _, err := io.Copy(&regularBundleBuffer, reader); err != nil {
+					panic(errors.Wrapf(err, "failed to copy file %s", header.Name))
+				}
+				var regularBundleReader io.Reader = &regularBundleBuffer
+				u, err := d.regularBundle(regularBundleReader, filename)
+				if err != nil {
+					panic(errors.Wrapf(err, "regular bundle failed %s", filename))
+				}
+				callback(*u)
+				nbBundle++
+				fmt.Println("AAAAAAAAAAAAAAAAAAAAAAAaa nbBundle ", nbBundle)
+			}
+		}
+	}
+	//*/
+	t := time.Now()
+	elapsed := t.Sub(start)
+
+	fmt.Println("AAAAAAAAAAaaa metabundle 100 AAAAAAAAAAAAAAAa elapsed: ", elapsed)
+}
+
+func (d *Downloader) regularBundle(body io.Reader, filename string) (*Update, error) {
+	var buf bytes.Buffer
+	baseURL := path.Join(d.client.Config().URL, d.path)
+
+	var loader bundle.DirectoryLoader
+	if d.persist {
+		tee := io.TeeReader(body, &buf)
+		loader = bundle.NewTarballLoaderWithBaseURL(tee, baseURL)
+	} else {
+		loader = bundle.NewTarballLoaderWithBaseURL(body, baseURL)
+	}
+
+	// .WithMetrics(m) TODO restore
+	reader := bundle.NewCustomReader(loader).WithBundleVerificationConfig(d.bvc)
+	if d.sizeLimitBytes != nil {
+		reader = reader.WithSizeLimitBytes(*d.sizeLimitBytes)
+	}
+	b, err := reader.Read()
+	if err != nil {
+		return nil, err
+	}
+	u := Update{ETag: b.Manifest.Revision, BundleName: filename, Bundle: &b, Error: nil, Metrics: nil, Raw: &buf}
+	return &u, nil
 }
