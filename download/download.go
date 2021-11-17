@@ -48,21 +48,22 @@ type Update struct {
 // updates from the remote HTTP endpoint that the client is configured to
 // connect to.
 type Downloader struct {
-	config            Config                        // downloader configuration for tuning polling and other downloader behaviour
-	client            rest.Client                   // HTTP client to use for bundle downloading
-	path              string                        // path to use in bundle download request
-	trigger           chan chan struct{}            // channel to signal downloads when manual triggering is enabled
-	stop              chan chan struct{}            // used to signal plugin to stop running
-	f                 func(context.Context, Update) // callback function invoked when download updates occur
-	etag              string                        // HTTP Etag for caching purposes
-	sizeLimitBytes    *int64                        // max bundle file size in bytes (passed to reader)
-	bvc               *bundle.VerificationConfig
-	respHdrTimeoutSec int64
-	wg                sync.WaitGroup
-	logger            logging.Logger
-	mtx               sync.Mutex
-	stopped           bool
-	persist           bool
+	config               Config                        // downloader configuration for tuning polling and other downloader behaviour
+	client               rest.Client                   // HTTP client to use for bundle downloading
+	path                 string                        // path to use in bundle download request
+	trigger              chan chan struct{}            // channel to signal downloads when manual triggering is enabled
+	stop                 chan chan struct{}            // used to signal plugin to stop running
+	f                    func(context.Context, Update) // callback function invoked when download updates occur
+	etag                 string                        // HTTP Etag for caching purposes
+	sizeLimitBytes       *int64                        // max bundle file size in bytes (passed to reader)
+	bvc                  *bundle.VerificationConfig
+	respHdrTimeoutSec    int64
+	wg                   sync.WaitGroup
+	logger               logging.Logger
+	mtx                  sync.Mutex
+	stopped              bool
+	persist              bool
+	handleHttpResponseOk func(response *http.Response, m metrics.Metrics) (*bundle.Bundle, *bytes.Buffer, error)
 }
 
 type downloaderResponse struct {
@@ -74,7 +75,7 @@ type downloaderResponse struct {
 
 // New returns a new Downloader that can be started.
 func New(config Config, client rest.Client, path string) *Downloader {
-	return &Downloader{
+	d := &Downloader{
 		config:  config,
 		client:  client,
 		path:    path,
@@ -82,6 +83,8 @@ func New(config Config, client rest.Client, path string) *Downloader {
 		stop:    make(chan chan struct{}),
 		logger:  client.Logger(),
 	}
+	d.handleHttpResponseOk = d.defaultHandleHttpResponseOk
+	return d
 }
 
 // WithCallback registers a function f to be called when download updates occur.
@@ -112,6 +115,11 @@ func (d *Downloader) WithSizeLimitBytes(n int64) *Downloader {
 // WithBundlePersistence specifies if the downloaded bundle will eventually be persisted to disk.
 func (d *Downloader) WithBundlePersistence(persist bool) *Downloader {
 	d.persist = persist
+	return d
+}
+
+func (d *Downloader) WithCustomHandleHttpResponseOk(f func(*http.Response, metrics.Metrics) (*bundle.Bundle, *bytes.Buffer, error)) *Downloader {
+	d.handleHttpResponseOk = f
 	return d
 }
 
@@ -287,45 +295,13 @@ func (d *Downloader) download(ctx context.Context, m metrics.Metrics) (*download
 
 	switch resp.StatusCode {
 	case http.StatusOK:
-		var buf bytes.Buffer
-		if resp.Body != nil {
-			d.logger.Debug("Download in progress.")
-			m.Timer(metrics.RegoLoadBundles).Start()
-			defer m.Timer(metrics.RegoLoadBundles).Stop()
-			baseURL := path.Join(d.client.Config().URL, d.path)
-
-			var loader bundle.DirectoryLoader
-			if d.persist {
-				tee := io.TeeReader(resp.Body, &buf)
-				loader = bundle.NewTarballLoaderWithBaseURL(tee, baseURL)
-			} else {
-				loader = bundle.NewTarballLoaderWithBaseURL(resp.Body, baseURL)
-			}
-
-			reader := bundle.NewCustomReader(loader).WithMetrics(m).WithBundleVerificationConfig(d.bvc)
-			if d.sizeLimitBytes != nil {
-				reader = reader.WithSizeLimitBytes(*d.sizeLimitBytes)
-			}
-			b, err := reader.Read()
-			if err != nil {
-				return nil, err
-			}
-
-			return &downloaderResponse{
-				b:        &b,
-				raw:      &buf,
-				etag:     resp.Header.Get("ETag"),
-				longPoll: isLongPollSupported(resp.Header),
-			}, nil
-		}
-
-		d.logger.Debug("Server replied with empty body.")
+		bundle, buffer, err := d.handleHttpResponseOk(resp, m)
 		return &downloaderResponse{
-			b:        nil,
-			raw:      nil,
-			etag:     "",
+			b:        bundle,
+			raw:      buffer,
+			etag:     resp.Header.Get("ETag"),
 			longPoll: isLongPollSupported(resp.Header),
-		}, nil
+		}, err
 	case http.StatusNotModified:
 		etag := resp.Header.Get("ETag")
 		if etag == "" {
@@ -348,4 +324,35 @@ func (d *Downloader) download(ctx context.Context, m metrics.Metrics) (*download
 
 func isLongPollSupported(header http.Header) bool {
 	return header.Get("Content-Type") == "application/vnd.openpolicyagent.bundles"
+}
+
+func (d *Downloader) defaultHandleHttpResponseOk(resp *http.Response, m metrics.Metrics) (*bundle.Bundle, *bytes.Buffer, error) {
+	if resp.Body == nil {
+		d.logger.Debug("Server replied with empty body.")
+		return nil, nil, nil
+	}
+	var buf bytes.Buffer
+	d.logger.Debug("Download in progress.")
+	m.Timer(metrics.RegoLoadBundles).Start()
+	defer m.Timer(metrics.RegoLoadBundles).Stop()
+	baseURL := path.Join(d.client.Config().URL, d.path)
+
+	var loader bundle.DirectoryLoader
+	if d.persist {
+		tee := io.TeeReader(resp.Body, &buf)
+		loader = bundle.NewTarballLoaderWithBaseURL(tee, baseURL)
+	} else {
+		loader = bundle.NewTarballLoaderWithBaseURL(resp.Body, baseURL)
+	}
+
+	reader := bundle.NewCustomReader(loader).WithMetrics(m).WithBundleVerificationConfig(d.bvc)
+	if d.sizeLimitBytes != nil {
+		reader = reader.WithSizeLimitBytes(*d.sizeLimitBytes)
+	}
+	b, err := reader.Read()
+	if err != nil {
+		return nil, nil, err
+	}
+	return &b, &buf, nil
+
 }
